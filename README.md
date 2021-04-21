@@ -12,6 +12,10 @@ Yes, it's set at 1,000. That should be high enough. You'll see in the demo below
 
 Linux, Python 3.7, and [this requirements.txt](requirements.txt).
 
+### Is it a problem with the ASGI server or a reverse proxy in the middle?
+
+No, there is no reverse proxy in this case. Also, the ASGI server is not the issue: You can see the bug surface when using either Daphne or Uvicorn.
+
 ### How to run?
 
 If you like Docker and don't have a localhost Redis server, do this:
@@ -26,6 +30,8 @@ If you want to run without Docker, and if you have a localhost Redis server alre
 ```
 pip3 install requirements.txt
 make run
+ # or
+make run_uvicorn
 ```
 
 ### How to produce the bug?
