@@ -1,4 +1,4 @@
-# Channels Issue
+# Channels Issue [#1683](https://github.com/django/channels/issues/1683)
 
 ### What is this?
 
