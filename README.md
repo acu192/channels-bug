@@ -57,3 +57,4 @@ while :; do timeout 1 python tester.py room_b; done
 
 In my experience, you have to wait a few minutes and then suddenly you'll see one or more clients error-out at the same time when the server drops a message.
 
+I've often seen the bug hit both groups ("room_a" and "room_b") at the same time, as if something deep in Channels has a hiccup that causes both rooms to lose messages.
