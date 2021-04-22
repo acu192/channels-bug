@@ -61,6 +61,13 @@ python tester.py room_b
 while :; do timeout 1 python tester.py room_b; done
 ```
 
-In my experience, you have to wait a few minutes and then suddenly you'll see one or more clients error-out at the same time when the server drops a message.
+### Observations
 
-I've often seen the bug hit both groups ("room_a" and "room_b") at the same time, as if something deep in Channels has a hiccup that causes both rooms to lose messages.
+1. You will often see clients error out at the same time (even clients that are in different groups!). This suggests the issue somehow spans across groups... a larger hiccup in the channel layer.
+
+2. I cannot reproduce the bug unless there are clients that connect-disconnect-reconnect in a loop. Before anyone says "oh, well of course messages are lost when a client disconnects". Yes, but no. I'm looking here at gaps in the sequence number of messages that **are delivered** to the peers. If there is a gap, there must have been a message dropped by the server, which is what happens in this case. Why do you need clients that connect-disconnect-reconnect in a loop? I don't know, but for some reason that is what it takes for gaps to appear in the sequence numbers.
+
+3. (corollary of #2 above) I thought for a while maybe it was due to the connection to Redis that were being "refreshed" or something, that is, I though maybe there were momentary times that Redis was disconnected from Channels. But... my observation in #2 is that this issue **does not happen** when you have a set of stable clients connected (I've run it for hours like this, no issue), whereas if you have even *one* client that does the connect-disconnect-reconnect loop, then you see the bug occur in a matter of minutes. Unless, does a client disconnecting cause the underlying Redis connection to reset, or something like that?
+
+4. I cannot reproduce it when using `InMemoryChannelLayer`... at all, no matter what I try, _suggesting_ (but not _proving_) that the issue is with the [Redis Channel Layer](https://github.com/django/channels_redis/).
+
