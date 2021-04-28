@@ -40,22 +40,40 @@ INSTALLED_APPS = [
     'channels',
 ]
 
-CHANNEL_LAYERS = {
-    'default': {
-        'BACKEND': 'channels_redis.core.RedisChannelLayer',
-        'CONFIG': {
-            "hosts": [('127.0.0.1', 6379)],
-            'prefix': 'channels_bug',
-            'capacity': 1000,
-        },
-    },
-}
+WHICH_CHANNEL_LAYER = 'redis_pubsub'  # options: 'in_memory', 'redis_mainline', 'redis_pubsub'
 
-#CHANNEL_LAYERS = {
-#    'default': {
-#        'BACKEND': 'channels.layers.InMemoryChannelLayer',
-#    },
-#}
+if WHICH_CHANNEL_LAYER == 'in_memory':
+    CHANNEL_LAYERS = {
+        'default': {
+            'BACKEND': 'channels.layers.InMemoryChannelLayer',
+        },
+    }
+
+elif WHICH_CHANNEL_LAYER == 'redis_mainline':
+    CHANNEL_LAYERS = {
+        'default': {
+            'BACKEND': 'channels_redis.core.RedisChannelLayer',
+            'CONFIG': {
+                "hosts": [('127.0.0.1', 6379)],
+                'prefix': 'channels_bug',
+                'capacity': 1000,
+            },
+        },
+    }
+
+elif WHICH_CHANNEL_LAYER == 'redis_pubsub':
+    CHANNEL_LAYERS = {
+        'default': {
+            'BACKEND': 'mysite.redis_channel_layer.RedisPubSubChannelLayer',
+            'CONFIG': {
+                "host": ('127.0.0.1', 6379),
+                'prefix': 'channels_bug',
+            },
+        },
+    }
+
+else:
+    raise ValueError('unknown WHICH_CHANNEL_LAYER =', WHICH_CHANNEL_LAYER)
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
