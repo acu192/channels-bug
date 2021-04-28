@@ -12,27 +12,45 @@ class RedisPubSubChannelLayer:
     Channel Layer that uses Redis's pub/sub functionality.
     """
 
-    extensions = ["groups"]
+    def __init__(self, hosts, prefix, **kwargs):
+        assert isinstance(hosts, list) and len(hosts) > 0, "`hosts` must be a list with at least one Redis server"
 
-    def __init__(self, host, prefix):
-        self.host = host
         self.prefix = prefix
 
         # Each consumer gets its own *specific* channel, created with the `new_channel()` method.
         # This dict maps `channel_name` to a queue of messages for that channel.
         self.channels = {}
 
-        # A channel can subscribe to a group.
+        # A channel can subscribe to zero or more groups.
         # This dict maps `group_name` to set of channel names who are subscribed to that group.
         self.groups = {}
 
-        # Private state:
-        self._lock = None
-        self._pub_conn = None
-        self._sub_conn = None
-        self._receiver = None
-        self._receive_task = None
-        self._keepalive_task = None
+        # For each host, we create a `RedisSingleShardConnection` to manage the connection to that host.
+        self._shards = [RedisSingleShardConnection(host, self) for host in hosts]
+
+    def _get_shard(self, channel_or_group_name):
+        """
+        Return the shard that is used exclusively for this channel or group.
+        """
+        if len(self._shards) == 1:
+            # Avoid the overhead of hashing and modulo when it is unnecessary.
+            return self._shards[0]
+        shard_index = abs(hash(channel_or_group_name)) % len(self._shards)
+        return self._shards[shard_index]
+
+    def _get_group_channel_name(self, group):
+        """
+        Return the channel name used by a group.
+        Includes '__group__' in the returned
+        string so that these names are distinguished
+        from those returned by `new_channel()`.
+        Technically collisions are possible, but it
+        takes what I believe is intentional abuse in
+        order to have colliding names.
+        """
+        return f'{self.prefix}__group__{group}'
+
+    extensions = ["groups"]
 
     ################################################################################
     # Channel layer API
@@ -42,8 +60,19 @@ class RedisPubSubChannelLayer:
         """
         Send a message onto a (general or specific) channel.
         """
-        conn = await self._get_pub_conn()
-        await conn.publish(channel, msgpack.packb(message))
+        shard = self._get_shard(channel)
+        await shard.publish(channel, message)
+
+    async def new_channel(self, prefix="specific."):
+        """
+        Returns a new channel name that can be used by a consumer in our
+        process as a specific channel.
+        """
+        channel = f'{self.prefix}{prefix}{uuid.uuid4().hex}'
+        self.channels[channel] = asyncio.Queue()
+        shard = self._get_shard(channel)
+        await shard.subscribe(channel)
+        return channel
 
     async def receive(self, channel):
         """
@@ -61,35 +90,25 @@ class RedisPubSubChannelLayer:
         try:
             message = await q.get()
         except asyncio.CancelledError:
-            # We are cancelled. It's possible we are *not the only* task that is cancelled
-            # that is waiting on this channel, in which case only *one* task should do the
-            # following clean-up. The following 'if-then-del' ensures only one task does
-            # the clean-up.
-            # NOTE: We assume here that the reason we are cancelled is because the consumer
-            #       is exiting, which is why we unsubscribe below. Indeed, currently the way
-            #       that Django channels works, this is a safe assumption.
+            # We assume here that the reason we are cancelled is because the consumer
+            # is exiting, therefore we need to cleanup by unsubscribe below. Indeed,
+            # currently the way that Django Channels works, this is a safe assumption.
+            # In the future, Dajngo Channels could change to call a *new* method that
+            # would serve as the antithesis of `new_channel()`; this new method might
+            # be named `delete_channel()`. If that were the case, we would do the
+            # following cleanup from that new `delete_channel()` method, but, since
+            # that's not how Django Channels works (yet), we do the cleanup below:
             if channel in self.channels:
                 del self.channels[channel]
                 try:
-                    conn = await self._get_sub_conn()
-                    await conn.unsubscribe(channel)
+                    shard = self._get_shard(channel)
+                    await shard.unsubscribe(channel)
                 except:
                     traceback.print_exc(file=sys.stderr)
-                    # We don't re-raise here because we want to the CancelledError to be the one re-raised below.
+                    # We don't re-raise here because we want the CancelledError to be the one re-raised.
             raise
 
         return msgpack.unpackb(message)
-
-    async def new_channel(self, prefix="specific."):
-        """
-        Returns a new channel name that can be used by something in our
-        process as a specific channel.
-        """
-        channel = f'{self.prefix}{prefix}{uuid.uuid4().hex}'
-        conn = await self._get_sub_conn()
-        self.channels[channel] = asyncio.Queue()
-        await conn.subscribe(self._receiver.channel(channel))
-        return channel
 
     ################################################################################
     # Groups extension
@@ -99,49 +118,106 @@ class RedisPubSubChannelLayer:
         """
         Adds the channel name to a group.
         """
-        group_channel = f'{self.prefix}__group__{group}'
-        conn = await self._get_sub_conn()
-        new = False
+        group_channel = self._get_group_channel_name(group)
         if group_channel not in self.groups:
             self.groups[group_channel] = set()
-            new = True
         group_channels = self.groups[group_channel]
         if channel not in group_channels:
             group_channels.add(channel)
-        if new:
-            await conn.subscribe(self._receiver.channel(group_channel))
+        shard = self._get_shard(group_channel)
+        await shard.subscribe(group_channel)
 
     async def group_discard(self, group, channel):
-        group_channel = f'{self.prefix}__group__{group}'
-        conn = await self._get_sub_conn()
+        """
+        Removes the channel from a group.
+        """
+        group_channel = self._get_group_channel_name(group)
         assert group_channel in self.groups
         group_channels = self.groups[group_channel]
         assert channel in group_channels
         group_channels.remove(channel)
         if len(group_channels) == 0:
             del self.groups[group_channel]
-            await conn.unsubscribe(group_channel)
+            shard = self._get_shard(group_channel)
+            await shard.unsubscribe(group_channel)
 
     async def group_send(self, group, message):
-        group_channel = f'{self.prefix}__group__{group}'
-        conn = await self._get_pub_conn()
-        await conn.publish(group_channel, msgpack.packb(message))
+        """
+        Send the message to all subscribers of the group.
+        """
+        group_channel = self._get_group_channel_name(group)
+        shard = self._get_shard(group_channel)
+        await shard.publish(group_channel, message)
 
-    ################################################################################
-    # Private methods
-    ################################################################################
+
+def on_close_noop(sender, exc=None):
+    """
+    If you don't pass an `on_close` function to the `Receiver`, then it
+    defaults to one that closes the Receiver whenever the last subscriber
+    unsubscribes. That is not what we want; instead, we want the Receiver
+    to continue even if no one is subscribed, because soon someone *will*
+    subscribe and we want things to continue from there. Passing this
+    empty function solves it.
+    """
+    pass
+
+
+class RedisSingleShardConnection:
+
+    def __init__(self, host, channel_layer):
+        self.host = host
+        self.channel_layer = channel_layer
+        self._subscribed_to = set()
+        self._lock = None
+        self._pub_conn = None
+        self._sub_conn = None
+        self._receiver = None
+        self._receive_task = None
+        self._keepalive_task = None
+
+    async def publish(self, channel, message):
+        conn = await self._get_pub_conn()
+        await conn.publish(channel, msgpack.packb(message))
+
+    async def subscribe(self, channel):
+        if channel not in self._subscribed_to:
+            self._subscribed_to.add(channel)
+            conn = await self._get_sub_conn()
+            await conn.subscribe(self._receiver.channel(channel))
+
+    async def unsubscribe(self, channel):
+        if channel in self._subscribed_to:
+            self._subscribed_to.remove(channel)
+            conn = await self._get_sub_conn()
+            await conn.unsubscribe(channel)
 
     async def _get_pub_conn(self):
+        """
+        Return the connection to this shard that is used for *publishing* messages.
+
+        If the connection is dead, automatically reconnect.
+        """
         if self._lock is None:
             self._lock = asyncio.Lock()
         async with self._lock:
             if self._pub_conn is not None and self._pub_conn.closed:
                 self._pub_conn = None
             if self._pub_conn is None:
-                self._pub_conn = await aioredis.create_redis(self.host)
+                while True:
+                    try:
+                        self._pub_conn = await aioredis.create_redis(self.host)
+                        break
+                    except:
+                        print(f"Failed to connect to Redis publish host: {self.host}; will try again in 1 second...", file=sys.stderr)
+                        await asyncio.sleep(1)
             return self._pub_conn
 
     async def _get_sub_conn(self):
+        """
+        Return the connection to this shard that is used for *subscribing* to channels.
+
+        If the connection is dead, automatically reconnect and resubscribe to all our channels!
+        """
         if self._keepalive_task is None:
             self._keepalive_task = asyncio.create_task(self._do_keepalive())
         if self._lock is None:
@@ -155,19 +231,25 @@ class RedisPubSubChannelLayer:
                     try:
                         await self._receive_task
                     except asyncio.CancelledError:
+                        # This is the normal case, that `asyncio.CancelledError` is throw. All good.
                         pass
                     except:
                         traceback.print_exc(file=sys.stderr)
-                        # Don't re-raise here. We don't care that much why _receive_task didn't end cleanly.
+                        # Don't re-raise here. We don't care that much why `_receive_task` didn't exit cleanly. Don't let this ruin your day!
                     self._receive_task = None
-                self._sub_conn = await aioredis.create_redis(self.host)
+                while True:
+                    try:
+                        self._sub_conn = await aioredis.create_redis(self.host)
+                        break
+                    except:
+                        print(f"Failed to connect to Redis subscribe host: {self.host}; will try again in 1 second...", file=sys.stderr)
+                        await asyncio.sleep(1)
                 self._receiver = aioredis.pubsub.Receiver(on_close=on_close_noop)
                 self._receive_task = asyncio.create_task(self._do_receiving())
-                # Do our best to recover from a disconnect/reconnect to Redis by re-subscribing to the channels/groups:
-                all_channels_and_groups = list(self.channels.keys()) + list(self.groups.keys())
-                if all_channels_and_groups:
-                    all_channels_and_groups = [self._receiver.channel(name) for name in all_channels_and_groups]
-                    await self._sub_conn.subscribe(*all_channels_and_groups)
+                if len(self._subscribed_to) > 0:
+                    # Do our best to recover by resubscribing to the channels that we were previously subscribed to.
+                    resubscribe_to = [self._receiver.channel(name) for name in self._subscribed_to]
+                    await self._sub_conn.subscribe(*resubscribe_to)
             return self._sub_conn
 
     async def _do_receiving(self):
@@ -175,12 +257,12 @@ class RedisPubSubChannelLayer:
             name = ch.name
             if isinstance(name, bytes):
                 name = name.decode()   # reversing what happens here: https://github.com/aio-libs/aioredis-py/blob/8a207609b7f8a33e74c7c8130d97186e78cc0052/aioredis/util.py#L17
-            if name in self.channels:
-                self.channels[name].put_nowait(message)
-            elif name in self.groups:
-                for channel_name in self.groups[name]:
-                    if channel_name in self.channels:
-                        self.channels[channel_name].put_nowait(message)
+            if name in self.channel_layer.channels:
+                self.channel_layer.channels[name].put_nowait(message)
+            elif name in self.channel_layer.groups:
+                for channel_name in self.channel_layer.groups[name]:
+                    if channel_name in self.channel_layer.channels:
+                        self.channel_layer.channels[channel_name].put_nowait(message)
 
     async def _do_keepalive(self):
         """
@@ -191,7 +273,11 @@ class RedisPubSubChannelLayer:
         hiccup, for example), then calling `self._get_sub_conn()` will reconnect and
         restore our old subscriptions. Thus, we want to do this on a predictable schedule.
         This is kinda a sub-optimal way to achieve this, but I can't find a way in aioredis
-        to get a notification when the connection dies.
+        to get a notification when the connection dies. I find this (sub-optimal) method
+        of checking the connection state works fine for my app; if Redis restarts, we reconnect
+        and resubscribe *quickly enough*; I mean, Redis restarting is already bad because it
+        will cause messages to get lost, and this periodic check at least minimizes the
+        damage *enough*.
 
         Note you wouldn't need this if you were *sure* that there would be a lot of subscribe/
         unsubscribe events on your site, because such events each call `self._get_sub_conn()`.
@@ -206,16 +292,4 @@ class RedisPubSubChannelLayer:
                 await self._get_sub_conn()
             except:
                 traceback.print_exc(file=sys.stderr)
-
-
-def on_close_noop(sender, exc=None):
-    """
-    If you don't pass an `on_close` function to the `Receiver`, then it
-    defaults to one that closes the Receiver whenever the last subscriber
-    unsubscribes. This isn't what we want; instead, we want the Receiver
-    to continue even if no one is subscribed, because soon someone will
-    subscribe and we want things to continue from there. Passing this
-    empty function solves it.
-    """
-    pass
 

@@ -66,7 +66,7 @@ elif WHICH_CHANNEL_LAYER == 'redis_pubsub':
         'default': {
             'BACKEND': 'mysite.redis_channel_layer.RedisPubSubChannelLayer',
             'CONFIG': {
-                "host": ('127.0.0.1', 6379),
+                "hosts": [('127.0.0.1', 6379)],
                 'prefix': 'channels_bug',
             },
         },
