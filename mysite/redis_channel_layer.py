@@ -1,10 +1,11 @@
 import asyncio
-import sys
-import traceback
+import logging
 import uuid
 
 import aioredis
 import msgpack
+
+logger = logging.getLogger(__name__)
 
 
 class RedisPubSubChannelLayer:
@@ -105,8 +106,8 @@ class RedisPubSubChannelLayer:
                 try:
                     shard = self._get_shard(channel)
                     await shard.unsubscribe(channel)
-                except Exception:
-                    traceback.print_exc(file=sys.stderr)
+                except BaseException:
+                    logger.exception("Unexpected exception while cleaning-up channel:")
                     # We don't re-raise here because we want the CancelledError to be the one re-raised.
             raise
 
@@ -209,17 +210,14 @@ class RedisSingleShardConnection:
         async with self._lock:
             if self._pub_conn is not None and self._pub_conn.closed:
                 self._pub_conn = None
-            if self._pub_conn is None:
-                while True:
-                    try:
-                        self._pub_conn = await aioredis.create_redis(self.host)
-                        break
-                    except Exception:
-                        print(
-                            f"Failed to connect to Redis publish host: {self.host}; will try again in 1 second...",
-                            file=sys.stderr,
-                        )
-                        await asyncio.sleep(1)
+            while self._pub_conn is None:
+                try:
+                    self._pub_conn = await aioredis.create_redis(self.host)
+                except BaseException:
+                    logger.warning(
+                        f"Failed to connect to Redis publish host: {self.host}; will try again in 1 second..."
+                    )
+                    await asyncio.sleep(1)
             return self._pub_conn
 
     async def _get_sub_conn(self):
@@ -243,18 +241,18 @@ class RedisSingleShardConnection:
                     except asyncio.CancelledError:
                         # This is the normal case, that `asyncio.CancelledError` is throw. All good.
                         pass
-                    except Exception:
-                        traceback.print_exc(file=sys.stderr)
+                    except BaseException:
+                        logger.exception(
+                            "Unexpected exception while canceling the receiver task:"
+                        )
                         # Don't re-raise here. We don't actually care why `_receive_task` didn't exit cleanly.
                     self._receive_task = None
-                while True:
+                while self._sub_conn is None:
                     try:
                         self._sub_conn = await aioredis.create_redis(self.host)
-                        break
-                    except Exception:
-                        print(
-                            f"Failed to connect to Redis subscribe host: {self.host}; will try again in 1 second...",
-                            file=sys.stderr,
+                    except BaseException:
+                        logger.warning(
+                            f"Failed to connect to Redis subscribe host: {self.host}; will try again in 1 second..."
                         )
                         await asyncio.sleep(1)
                 self._receiver = aioredis.pubsub.Receiver(on_close=on_close_noop)
@@ -285,7 +283,7 @@ class RedisSingleShardConnection:
         """
         This task's simple job is just to call `self._get_sub_conn()` periodically.
 
-        Why? Well, calling `self._get_sub_conn()` has the nice side-affect that if
+        Why? Well, calling `self._get_sub_conn()` has the nice side-effect that if
         that connection has died (because Redis was restarted, or there was a networking
         hiccup, for example), then calling `self._get_sub_conn()` will reconnect and
         restore our old subscriptions. Thus, we want to do this on a predictable schedule.
@@ -308,4 +306,4 @@ class RedisSingleShardConnection:
             try:
                 await self._get_sub_conn()
             except Exception:
-                traceback.print_exc(file=sys.stderr)
+                logger.exception("Unexpected exception in keepalive task:")
