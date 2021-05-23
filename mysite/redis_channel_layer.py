@@ -13,7 +13,9 @@ class RedisPubSubChannelLayer:
     Channel Layer that uses Redis's pub/sub functionality.
     """
 
-    def __init__(self, hosts, prefix="asgi", **kwargs):
+    def __init__(self, hosts=None, prefix="asgi", **kwargs):
+        if hosts is None:
+            hosts = [("localhost", 6379)]
         assert (
             isinstance(hosts, list) and len(hosts) > 0
         ), "`hosts` must be a list with at least one Redis server"
@@ -53,7 +55,7 @@ class RedisPubSubChannelLayer:
         """
         return f"{self.prefix}__group__{group}"
 
-    extensions = ["groups"]
+    extensions = ["groups", "flush"]
 
     ################################################################################
     # Channel layer API
@@ -158,6 +160,21 @@ class RedisPubSubChannelLayer:
         shard = self._get_shard(group_channel)
         await shard.publish(group_channel, message)
 
+    ################################################################################
+    # Flush extension
+    ################################################################################
+
+    async def flush(self):
+        """
+        Flush the layer, making it like new. It can continue to be used as if it
+        was just created. This also closes connections, serving as a clean-up
+        method; connections will be re-opened if you continue using this layer.
+        """
+        self.channels = {}
+        self.groups = {}
+        for shard in self._shards:
+            await shard.flush()
+
 
 def on_close_noop(sender, exc=None):
     """
@@ -199,6 +216,27 @@ class RedisSingleShardConnection:
             conn = await self._get_sub_conn()
             await conn.unsubscribe(channel)
 
+    async def flush(self):
+        for task in [self._keepalive_task, self._receive_task]:
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        self._keepalive_task = None
+        self._receive_task = None
+        self._receiver = None
+        if self._sub_conn is not None:
+            self._sub_conn.close()
+            await self._sub_conn.wait_closed()
+            self._sub_conn = None
+        if self._pub_conn is not None:
+            self._pub_conn.close()
+            await self._pub_conn.wait_closed()
+            self._pub_conn = None
+        self._subscribed_to = set()
+
     async def _get_pub_conn(self):
         """
         Return the connection to this shard that is used for *publishing* messages.
@@ -227,7 +265,7 @@ class RedisSingleShardConnection:
         If the connection is dead, automatically reconnect and resubscribe to all our channels!
         """
         if self._keepalive_task is None:
-            self._keepalive_task = asyncio.create_task(self._do_keepalive())
+            self._keepalive_task = asyncio.ensure_future(self._do_keepalive())
         if self._lock is None:
             self._lock = asyncio.Lock()
         async with self._lock:
@@ -256,7 +294,7 @@ class RedisSingleShardConnection:
                         )
                         await asyncio.sleep(1)
                 self._receiver = aioredis.pubsub.Receiver(on_close=on_close_noop)
-                self._receive_task = asyncio.create_task(self._do_receiving())
+                self._receive_task = asyncio.ensure_future(self._do_receiving())
                 if len(self._subscribed_to) > 0:
                     # Do our best to recover by resubscribing to the channels that we were previously subscribed to.
                     resubscribe_to = [
