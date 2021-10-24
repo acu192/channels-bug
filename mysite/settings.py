@@ -40,7 +40,7 @@ INSTALLED_APPS = [
     'channels',
 ]
 
-WHICH_CHANNEL_LAYER = 'redis_mainline'  # options: 'in_memory', 'redis_mainline', 'redis_pubsub'
+WHICH_CHANNEL_LAYER = 'redis_pubsub'  # options: 'in_memory', 'redis_mainline', 'redis_pubsub'
 
 if WHICH_CHANNEL_LAYER == 'in_memory':
     CHANNEL_LAYERS = {
